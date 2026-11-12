@@ -1,3 +1,5 @@
+import { randomUUID } from "crypto";
+import { performance } from "perf_hooks";
 import { Router, Response } from "express";
 import multer from "multer";
 import { authMiddleware, AuthRequest } from "../middleware/auth.middleware";
@@ -21,6 +23,37 @@ const upload = multer({
   },
 });
 
+interface TurnTimings {
+  sttMs: number;
+  llmMs: number;
+  ttsMs: number;
+}
+
+type TurnStage = "stt" | "llm" | "tts" | "post";
+
+// One structured line per voice turn. Stages that did not run stay at 0.
+// On error, failedStage and failedStageMs (elapsed time of the in-flight stage) are added.
+function logTurnTiming(
+  requestId: string,
+  t: TurnTimings,
+  turnStart: number,
+  status: "ok" | "error",
+  failed?: { stage: TurnStage; ms: number }
+): void {
+  console.log(
+    JSON.stringify({
+      event: "voice_turn",
+      requestId,
+      status,
+      sttMs: Math.round(t.sttMs),
+      llmMs: Math.round(t.llmMs),
+      ttsMs: Math.round(t.ttsMs),
+      totalMs: Math.round(performance.now() - turnStart),
+      ...(failed ? { failedStage: failed.stage, failedStageMs: Math.round(failed.ms) } : {}),
+    })
+  );
+}
+
 // POST /api/entries/voice (Protected)
 router.post(
   "/voice",
@@ -28,6 +61,13 @@ router.post(
   voiceUploadLimiter,
   upload.single("audio"),
   async (req: AuthRequest, res: Response): Promise<any> => {
+    const requestId = randomUUID();
+    res.setHeader("X-Request-Id", requestId);
+    const turnStart = performance.now();
+    const timings: TurnTimings = { sttMs: 0, llmMs: 0, ttsMs: 0 };
+    let stage: TurnStage = "stt";
+    let stageStart = turnStart;
+
     if (!req.user) {
       return res.status(401).json({ error: "Unauthenticated" });
     }
@@ -42,31 +82,46 @@ router.post(
 
 
       // 1. Call Deepgram STT
+      stageStart = performance.now();
       const transcript = await sttService.transcribeAudio(
         req.file.buffer,
         req.file.mimetype || "audio/webm"
       );
+      timings.sttMs = performance.now() - stageStart;
 
       const cleanedTranscript = transcript || "(No speech detected)";
 
       let mrbrownResponseText = "";
       let mrbrownAudioBase64: string | null = null;
+      let degraded = false;
 
       if (cleanedTranscript === "(No speech detected)") {
         mrbrownResponseText = "I couldn't quite hear you — could you try speaking a little closer to the mic?";
       } else {
         // 2. Call LLM Service (OpenAI) to generate Mr Brown's text response
-        mrbrownResponseText = await llmService.generateMrBrownResponse(
+        stage = "llm";
+        stageStart = performance.now();
+        const llmReply = await llmService.generateMrBrownResponse(
           req.user.userId,
           cleanedTranscript
         );
+        mrbrownResponseText = llmReply.text;
+        timings.llmMs = performance.now() - stageStart;
 
         // 3. Call TTS Service (ElevenLabs) to convert Mr Brown's response to audio bytes
+        stage = "tts";
+        stageStart = performance.now();
         const mrbrownAudioBuffer = await ttsService.generateSpeech(mrbrownResponseText);
+        timings.ttsMs = performance.now() - stageStart;
         mrbrownAudioBase64 = mrbrownAudioBuffer.length > 0
           ? mrbrownAudioBuffer.toString("base64")
           : null;
+        // The LLM and TTS services swallow provider errors; surface them to the client.
+        degraded = llmReply.degraded || mrbrownAudioBase64 === null;
       }
+
+      stage = "post";
+      stageStart = performance.now();
 
       // 4. Call Sentiment Service to analyze emotional tone
       const sentiment = await sentimentService.analyzeSentiment(cleanedTranscript);
@@ -102,11 +157,17 @@ router.post(
       await deleteCachePattern(`entries:list:${req.user.userId}:*`);
       await deleteCache(`entries:stats:${req.user.userId}`);
 
+      logTurnTiming(requestId, timings, turnStart, "ok");
       return res.json({ 
         entry,
-        mrbrownAudio: mrbrownAudioBase64 
+        mrbrownAudio: mrbrownAudioBase64,
+        degraded,
       });
     } catch (error: any) {
+      logTurnTiming(requestId, timings, turnStart, "error", {
+        stage,
+        ms: performance.now() - stageStart,
+      });
       console.error("[Entries Router Error]", error);
       return res.status(500).json({ error: error.message || "Failed to process audio entry" });
     }

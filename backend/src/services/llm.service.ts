@@ -1,6 +1,12 @@
 import OpenAI from "openai";
 import prisma from "../lib/prisma";
 
+export interface LLMReply {
+  text: string;
+  // true when the reply is the canned fallback (no key, or the provider errored)
+  degraded: boolean;
+}
+
 export class LLMService {
   private openai: OpenAI | null = null;
 
@@ -18,7 +24,7 @@ export class LLMService {
     }
   }
 
-  async generateMrBrownResponse(userId: string, currentTranscript: string): Promise<string> {
+  async generateMrBrownResponse(userId: string, currentTranscript: string): Promise<LLMReply> {
     console.log(`[LLM Service] Generating Mr Brown response for user ${userId}. Prompt length: ${currentTranscript.length}`);
     
     // Fetch last 5 entries for conversation memory context
@@ -50,7 +56,7 @@ export class LLMService {
       if (process.env.GEMINI_API_KEY) {
         return this.generateGeminiResponse(currentTranscript, pastContext);
       }
-      return this.generateMockResponse(currentTranscript);
+      return { text: this.generateMockResponse(currentTranscript), degraded: true };
     }
 
     try {
@@ -90,14 +96,14 @@ Keep your response warm and natural (aim for 1 to 3 short paragraphs depending o
 
       const reply = response.choices[0]?.message?.content?.trim() || "";
       console.log(`[LLM Service] Response generated: "${reply}"`);
-      return reply;
+      return { text: reply, degraded: false };
     } catch (error) {
       console.error("[LLM Service] OpenAI API error:", error);
-      return this.generateMockResponse(currentTranscript);
+      return { text: this.generateMockResponse(currentTranscript), degraded: true };
     }
   }
 
-  private async generateGeminiResponse(currentTranscript: string, pastContext: string): Promise<string> {
+  private async generateGeminiResponse(currentTranscript: string, pastContext: string): Promise<LLMReply> {
     const geminiKey = process.env.GEMINI_API_KEY;
     try {
       const systemPrompt = `You are Mr Brown, a warm, thoughtful, and highly empathetic AI companion for a personal voice diary. 
@@ -149,10 +155,10 @@ Keep your response warm and natural (aim for 1 to 3 short paragraphs depending o
       const data = await response.json() as any;
       const reply = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
       console.log(`[LLM Service] Gemini response generated: "${reply}"`);
-      return reply;
+      return { text: reply, degraded: false };
     } catch (error) {
       console.error("[LLM Service] Gemini API error:", error);
-      return this.generateMockResponse(currentTranscript);
+      return { text: this.generateMockResponse(currentTranscript), degraded: true };
     }
   }
 
